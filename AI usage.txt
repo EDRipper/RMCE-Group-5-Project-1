@@ -1,0 +1,138 @@
+I use AI while coding. I write in VScode, with autocomplete enabled.
+I also use claude to ask clarifying questions with code examples.
+I do not paste in code I do not understand, and I document the prompts and responses here.
+
+#prompt
+i need to know the current position of the front motor, which will angle the front wheels. the kit is the Makeblock Ultimate 2.0 and im using the  the 25mm DC Encoder Motor 
+can you explain quadrature decoding and if its applicable here with code examples
+
+#response
+Short answer
+Yes, quadrature decoding is how you'll get the steering position. The 25mm encoder motor has a quadrature encoder built in, and Makeblock's MeEncoderOnBoard class already decodes it for you on the MegaPi.
+
+Your current code won't do it, though. grabber.ino:20 drives the front motor as a MeMegaPiDCMotor on PORT1B. That class only sends power and never reads the encoder. To get position you need to:
+
+Plug the motor's 6‑pin encoder cable into the MegaPi's encoder header for that port, not the 2‑pin A/B motor header.
+Control it with MeEncoderOnBoard Encoder_1(SLOT1) instead of MeMegaPiDCMotor.
+As far as I know, SLOT1 and PORT1B use the same motor driver channel. Don't create both objects for the same port.
+
+What quadrature decoding is
+The encoder has a magnetic disc on the motor shaft and two sensors, called A and B. Each one outputs a square wave as the shaft turns. They're placed so that B is a quarter of a cycle (90°) behind A, which is where "quadrature" comes from:
+
+
+Forward (A leads B):        Reverse (B leads A):
+A: _|‾‾|__|‾‾|__            A: __|‾‾|__|‾‾|_
+B: __|‾‾|__|‾‾|_            B: _|‾‾|__|‾‾|__
+Counting edges tells you how far the shaft has moved.
+Checking which signal changes first tells you which way it turned.
+Together the two signals step through four states: 00 → 01 → 11 → 10 → 00. Going one way round that cycle counts +1 and going the other way counts −1.
+
+There are three ways to decode it. They differ in which edges you count:
+
+Mode	Edges counted	Counts per encoder cycle
+1x	Rising edges of A only. Read B to get the direction.	1
+2x	Rising and falling edges of A	2
+4x	Every edge on both A and B	4
+On the MegaPi only A is wired to an interrupt pin (pin 18 for SLOT1). B goes to pin 31, which isn't interrupt‑capable. That rules out true 4x with interrupts, so you're limited to 1x or 2x. Makeblock's library uses 1x.
+
+Is it enough resolution for steering?
+Makeblock's examples for this motor (the 9V/185RPM version) use setPulse(8) and setRatio(46.67). Check the label on your motor, because other RPM versions have different gear ratios.
+
+8 pulses × 46.67 gear ratio ≈ 373 counts per output‑shaft revolution at 1x, which is about 1° per count.
+2x gives about 0.5° per count.
+That's plenty for steering. The gearbox has a bit of backlash (play), which will matter more than encoder resolution.
+
+Option 1: Makeblock's library (recommended)
+This approach handles position and gives you a built‑in PID controller (a feedback loop that drives the motor to a target angle), so you can call moveTo(angle).
+
+
+#include <MeMegaPi.h>
+
+MeEncoderOnBoard steerMotor(SLOT1);   // replaces MeMegaPiDCMotor motor(PORT1B)
+
+// Runs on every rising edge of A. Read B to decide the direction (1x decoding)
+void isr_steer() {
+    if (digitalRead(steerMotor.getPortB()) == 0)
+        steerMotor.pulsePosMinus();
+    else
+        steerMotor.pulsePosPlus();
+}
+
+void setup() {
+    Serial.begin(115200);
+    attachInterrupt(steerMotor.getIntNum(), isr_steer, RISING);
+
+    // Makeblock examples set the PWM frequency to 8 kHz for encoder motors
+    TCCR1A = _BV(WGM10);
+    TCCR1B = _BV(CS11) | _BV(WGM12);
+    TCCR2A = _BV(WGM21) | _BV(WGM20);
+    TCCR2B = _BV(CS21);
+
+    steerMotor.setPulse(8);
+    steerMotor.setRatio(46.67);
+    steerMotor.setPosPid(1.8, 0, 1.2);   // gains from Makeblock's examples, tune if needed
+    steerMotor.setSpeedPid(0.18, 0, 0);
+
+    steerMotor.setPulsePos(0);   // treat the current position as "straight"
+}
+
+void loop() {
+    steerMotor.loop();   // must be called every loop for moveTo() to work, so avoid delay()
+
+    Serial.println(steerMotor.getCurPos());   // output-shaft angle in degrees
+
+    // e.g. steer 30° left, then come back
+    // steerMotor.moveTo(-30, 100);   // (target degrees, speed in RPM)
+    // steerMotor.moveTo(0, 100);
+}
+getCurPos() returns degrees, and getPulsePos() returns raw counts.
+
+Option 2: write your own decoder (2x, to see how it works)
+
+#include <MeMegaPi.h>
+
+MeEncoderOnBoard steerMotor(SLOT1);   // still used for the pin numbers and motor driver
+volatile long steerCount = 0;         // volatile because the ISR changes it
+
+// Interrupt on BOTH edges of A (2x decoding)
+void isr_steer() {
+    bool a = digitalRead(steerMotor.getPortA());
+    bool b = digitalRead(steerMotor.getPortB());
+    // If A just changed to match B, B led the change, so we're going one way.
+    // Otherwise A is leading, so we're going the other way.
+    if (a == b) steerCount--;
+    else        steerCount++;   // swap these if the sign comes out backwards
+}
+
+const float COUNTS_PER_DEG = (8 * 2 * 46.67) / 360.0;   // pulses × 2x × gear ratio
+
+long readCount() {
+    noInterrupts();   // a long is 4 bytes on AVR, so read it atomically
+    long c = steerCount;
+    interrupts();
+    return c;
+}
+
+void setup() {
+    Serial.begin(115200);
+    attachInterrupt(steerMotor.getIntNum(), isr_steer, CHANGE);
+}
+
+void loop() {
+    float angle = readCount() / COUNTS_PER_DEG;
+    Serial.println(angle);
+
+    // simple bang-bang hold at 0°; use the PID from Option 1 for smooth control
+    if (angle > 2)       steerMotor.setMotorPwm(-120);
+    else if (angle < -2) steerMotor.setMotorPwm(120);
+    else                 steerMotor.setMotorPwm(0);
+}
+Things that will catch you out with steering
+The encoder only gives relative position. It counts from 0 at power‑on and doesn't know where "straight" is. Either line the wheels up straight before turning on, or home them at startup. To home: drive slowly to one end stop, watch for the count to stop changing (stalled), zero it there, then move to centre.
+Motor angle isn't wheel angle. If there's a linkage or gearing between the motor and the wheels, measure the ratio and convert.
+delay() breaks it. openGrabber() and closeGrabber() call delay(1000), and while that runs loop() can't call steerMotor.loop(), so steering stops correcting. The interrupt still counts, so the position stays correct. Eventually those delays should become millis()‑based timers.
+Your line‑follower switch could become steerMotor.moveTo(-20, 100) / moveTo(0, …) / moveTo(20, …), which would also handle the jitter TODO.
+Two unrelated problems in grabber.ino will stop it compiling:
+
+closeGrabber() is missing its closing } (line 59).
+std::cout on line 78 doesn't exist on AVR Arduino boards. Use Serial.println("Closing grabbe
